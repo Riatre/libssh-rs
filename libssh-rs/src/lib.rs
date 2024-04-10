@@ -17,8 +17,8 @@ use std::os::unix::io::RawFd as RawSocket;
 #[cfg(windows)]
 use std::os::windows::io::RawSocket;
 use std::ptr::null_mut;
-use std::sync::Once;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Once, Weak};
 use std::time::Duration;
 
 mod channel;
@@ -72,9 +72,18 @@ fn initialize() -> SshResult<()> {
 }
 
 pub(crate) struct SessionHolder {
+    outer: Weak<Mutex<SessionHolder>>,
     sess: sys::ssh_session,
     callbacks: sys::ssh_callbacks_struct,
     auth_callback: Option<Box<dyn FnMut(&str, bool, bool, Option<String>) -> SshResult<String>>>,
+    channel_open_request_auth_agent_callback: Option<
+        Box<
+            dyn Fn(
+                &dyn UnlockedSession,
+                fn(&Channel) -> SshResult<sys::ssh_channel>,
+            ) -> SshResult<sys::ssh_channel>,
+        >,
+    >,
 }
 unsafe impl Send for SessionHolder {}
 
@@ -159,6 +168,25 @@ impl SessionHolder {
     }
 }
 
+pub trait UnlockedSession {
+    fn new_channel(&self) -> SshResult<Channel>;
+}
+
+impl UnlockedSession for SessionHolder {
+    fn new_channel(&self) -> SshResult<Channel> {
+        let chan = unsafe { sys::ssh_channel_new(self.sess) };
+        if chan.is_null() {
+            if let Some(err) = self.last_error() {
+                Err(err)
+            } else {
+                Err(Error::fatal("ssh_channel_new failed"))
+            }
+        } else {
+            Ok(Channel::new(&self.outer.upgrade().unwrap(), chan))
+        }
+    }
+}
+
 /// A Session represents the state needed to make a connection to
 /// a remote host.
 ///
@@ -197,11 +225,16 @@ impl Session {
                 channel_open_request_x11_function: None,
                 channel_open_request_auth_agent_function: None,
             };
-            let sess = Arc::new(Mutex::new(SessionHolder {
-                sess,
-                callbacks,
-                auth_callback: None,
-            }));
+            let sess = Arc::new_cyclic(|outer| {
+                let outer = outer.clone();
+                Mutex::new(SessionHolder {
+                    outer,
+                    sess,
+                    callbacks,
+                    auth_callback: None,
+                    channel_open_request_auth_agent_callback: None,
+                })
+            });
 
             {
                 let mut sess = sess.lock().unwrap();
@@ -274,6 +307,41 @@ impl Session {
         }
     }
 
+    unsafe extern "C" fn bridge_channel_open_request_auth_agent_callback(
+        session: sys::ssh_session,
+        userdata: *mut ::std::os::raw::c_void,
+    ) -> sys::ssh_channel {
+        let result = std::panic::catch_unwind(|| -> SshResult<sys::ssh_channel> {
+            let sess: &mut SessionHolder = &mut *(userdata as *mut SessionHolder);
+            assert!(
+                std::ptr::eq(session, sess.sess),
+                "invalid callback invocation: session mismatch"
+            );
+            let cb = sess
+                .channel_open_request_auth_agent_callback
+                .as_ref()
+                .unwrap();
+            cb(sess, |chan| Ok(chan.chan_inner))
+        });
+        match result {
+            Err(err) => {
+                eprintln!(
+                    "Panic in channel open request auth agent callback: {:?}",
+                    err
+                );
+                std::ptr::null_mut()
+            }
+            Ok(Err(err)) => {
+                eprintln!(
+                    "Error in channel open request auth agent callback: {:#}",
+                    err
+                );
+                std::ptr::null_mut()
+            }
+            Ok(Ok(chan)) => chan,
+        }
+    }
+
     /// Sets a callback that is used by libssh when it needs to prompt
     /// for the passphrase during public key authentication.
     /// This is NOT used for password or keyboard interactive authentication.
@@ -324,6 +392,21 @@ impl Session {
         let mut sess = self.lock_session();
         sess.auth_callback.replace(Box::new(callback));
         sess.callbacks.auth_function = Some(Self::bridge_auth_callback);
+    }
+
+    pub fn set_channel_open_request_auth_agent_callback<F>(&self, callback: F)
+    where
+        F: Fn(
+                &dyn UnlockedSession,
+                fn(&Channel) -> SshResult<sys::ssh_channel>,
+            ) -> SshResult<sys::ssh_channel>
+            + 'static,
+    {
+        let mut sess = self.lock_session();
+        sess.channel_open_request_auth_agent_callback
+            .replace(Box::new(callback));
+        sess.callbacks.channel_open_request_auth_agent_function =
+            Some(Self::bridge_channel_open_request_auth_agent_callback);
     }
 
     /// Create a new channel.
